@@ -139,22 +139,6 @@ class SessionRegistry:
             return True
         return False
 
-    async def status(self, key: str) -> dict[str, Any]:
-        conv = self._conversations.get(key)
-        if conv is None or conv.session is None:
-            return {"active": False}
-        s = conv.session
-        return {
-            "active": s.alive,
-            "busy": s.busy(),
-            "session_id": s.session_id,
-            "pid": s.pid,
-            "model": s.model or "(cli default)",
-            "cwd": s.cwd,
-            "age_hours": round((time.time() - conv.created_at) / 3600, 2),
-            "queued": conv.queue.qsize(),
-        }
-
     async def close_all(self) -> None:
         async with self._lock:
             for conv in self._conversations.values():
