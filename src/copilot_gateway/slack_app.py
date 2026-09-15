@@ -208,7 +208,7 @@ class PermissionManager:
         return True
 
 
-RESERVED_COMMANDS = {"/new", "/stop", "/status", "/help"}
+RESERVED_COMMANDS = {"/new", "/stop", "/status", "/tasks", "/help"}
 
 HELP_TEXT = """*copilot-slack-gateway commands*
 • just type — talk to Copilot (reuses this thread's persistent session)
@@ -216,6 +216,7 @@ HELP_TEXT = """*copilot-slack-gateway commands*
 • `/new` — discard this thread's Copilot session and start fresh
 • `/stop` — cancel the currently running prompt
 • `/status` — show session info (pid, session id, model, age, queue)
+• `/tasks` — show active subagents and shell commands in this Copilot session
 • `/help` — this message
 """
 
@@ -363,8 +364,12 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             if command == "/help":
                 await post(reply_conv, HELP_TEXT)
                 return
-            # Not a gateway command — treat as a Copilot skill invocation.
-            text = skill_invocation_prompt(command.lstrip("/"), arg)
+            if command == "/tasks":
+                # `/tasks` is a native Copilot ACP command, not a skill invocation.
+                text = f"{command} {arg}".strip()
+            else:
+                # Not a gateway command — treat as a Copilot skill invocation.
+                text = skill_invocation_prompt(command.lstrip("/"), arg)
         conv, fresh = await registry.get_or_create(
             key,
             channel=channel,

@@ -1,4 +1,4 @@
-"""Generate slack-app-manifest.yaml with one slash command per skill.
+"""Generate slack-app-manifest.yaml with one slash command per built-in or skill.
 
 Slack caps apps at 25 slash commands, so pass the skills you want
 autocomplete for (or edit CURATED below). All other skills still work when
@@ -27,11 +27,12 @@ SKILLS_DIR = (
 MANIFEST = Path(__file__).resolve().parent.parent / "slack-app-manifest.yaml"
 MAX_COMMANDS = 25
 
-CURATED = ["new", "stop", "status", "help"]
+CURATED = ["new", "stop", "status", "tasks", "help"]
 BUILTIN_DESCRIPTIONS = {
     "new": "Start a fresh Copilot session",
     "stop": "Cancel the active Copilot prompt",
     "status": "Show the current Copilot session status",
+    "tasks": "Show active subagents and shell commands in this Copilot session",
     "help": "Show gateway usage help",
 }
 

@@ -64,6 +64,7 @@ DM the bot (or @mention it in a channel — replies stay in the thread):
 - `/new` — discard this thread's session, start fresh
 - `/stop` — cancel the running prompt
 - `/status` — session id, pid, model, age, queue depth
+- `/tasks` — active subagents and shell commands in this Copilot session
 - `/help` — list commands
 
 Tool permission requests appear as **Approve / Deny buttons** in the thread
