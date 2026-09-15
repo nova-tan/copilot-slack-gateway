@@ -29,7 +29,12 @@ streamed replies + permission buttons ◀── session/update, request_permissi
 ## Setup
 
 1. **Create the Slack app** at <https://api.slack.com/apps> → *Create New App* →
-   *From a manifest* → paste `slack-app-manifest.yaml`.
+   *From a manifest*. First copy the public example to the ignored local
+   manifest, then paste it:
+
+   ```bash
+   cp slack-app-manifest.example.yaml slack-app-manifest.yaml
+   ```
 2. **Enable Socket Mode**: *Settings → Socket Mode* → enable, generate an
    app-level token (`xapp-...`) with `connections:write`.
 3. **Install to workspace** and copy the bot token (`xoxb-...`).
@@ -50,11 +55,11 @@ streamed replies + permission buttons ◀── session/update, request_permissi
    `launchd/com.example.copilot-slack-gateway.plist`. Replace the
    `__PROJECT_DIR__` and `__HOME_DIR__` placeholders before loading it.
 
-The checked-in Slack manifest registers the built-in gateway commands. To
-register additional Copilot skills as slash commands, run
-`python scripts/gen_manifest.py skill-one skill-two ...`. Set
-`COPILOT_SKILLS_DIR` if you want the generator to read descriptions from local
-skill files.
+The checked-in example manifest registers the built-in gateway commands. The
+local `slack-app-manifest.yaml` is intentionally ignored because its slash
+commands may be workspace-specific. To register additional Copilot skills as
+slash commands, edit the local manifest directly or ask your coding agent to
+update it.
 
 ## Usage
 

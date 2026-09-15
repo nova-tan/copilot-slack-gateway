@@ -4,6 +4,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+slack-app-manifest.yaml
 .DS_Store
 .copilot-slack-gateway/
 *.log
