@@ -27,11 +27,10 @@ SKILLS_DIR = (
 MANIFEST = Path(__file__).resolve().parent.parent / "slack-app-manifest.yaml"
 MAX_COMMANDS = 25
 
-CURATED = ["new", "stop", "status", "tasks", "help"]
+CURATED = ["new", "stop", "tasks", "help"]
 BUILTIN_DESCRIPTIONS = {
     "new": "Start a fresh Copilot session",
     "stop": "Cancel the active Copilot prompt",
-    "status": "Show the current Copilot session status",
     "tasks": "Show active subagents and shell commands in this Copilot session",
     "help": "Show gateway usage help",
 }

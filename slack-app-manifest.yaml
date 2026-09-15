@@ -25,10 +25,6 @@ features:
         description: "Cancel the active Copilot prompt"
         should_escape: false
         usage_hint: "[args]"
-      - command: /status
-        description: "Show the current Copilot session status"
-        should_escape: false
-        usage_hint: "[args]"
       - command: /tasks
         description: "Show active subagents and shell commands in this Copilot session"
         should_escape: false
