@@ -109,6 +109,7 @@ class ACPSession:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._active_tools: dict[str, dict[str, str]] = {}
         self._next_id = itertools.count(1)
         self._write_lock = asyncio.Lock()
         self._prompt_lock = asyncio.Lock()
@@ -122,6 +123,10 @@ class ACPSession:
 
     def busy(self) -> bool:
         return self._prompt_lock.locked()
+
+    def active_tasks(self) -> list[dict[str, str]]:
+        """Return the currently active ACP tool calls without exposing inputs."""
+        return [dict(task) for task in self._active_tools.values()]
 
     async def _write(self, payload: dict[str, Any]) -> None:
         if self._proc is None or self._proc.stdin is None:
@@ -188,6 +193,7 @@ class ACPSession:
         self._stopping = True
         proc, self._proc = self._proc, None
         self.session_id = None
+        self._active_tools.clear()
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(SessionDeadError("session closed"))
@@ -269,6 +275,7 @@ class ACPSession:
             return
         logger.warning("copilot ACP process exited (pid=%s, session=%s)", self.pid, self.session_id)
         self.session_id = None
+        self._active_tools.clear()
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(SessionDeadError("copilot ACP process exited"))
@@ -309,6 +316,20 @@ class ACPSession:
         elif kind == "agent_thought_chunk" and text:
             await self.on_event("thought", {"text": text})
         elif kind in ("tool_call", "tool_call_update"):
+            tool_call_id = str(update.get("toolCallId") or "").strip()
+            if tool_call_id:
+                task = self._active_tools.setdefault(tool_call_id, {})
+                title = str(update.get("title") or "").strip()
+                tool_kind = str(update.get("kind") or "").strip()
+                status = str(update.get("status") or "").strip()
+                if title:
+                    task["title"] = title
+                if tool_kind:
+                    task["kind"] = tool_kind
+                if status:
+                    task["status"] = status
+                if status.lower() in {"completed", "failed", "cancelled", "canceled", "error"}:
+                    self._active_tools.pop(tool_call_id, None)
             await self.on_event("tool", {
                 "title": str(update.get("title") or "tool"),
                 "kind": str(update.get("kind") or ""),

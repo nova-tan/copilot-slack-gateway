@@ -68,12 +68,16 @@ DM the bot (or @mention it in a channel — replies stay in the thread):
 - just type — talk to Copilot
 - `/new` — discard this thread's session, start fresh
 - `/stop` — cancel the running prompt
-- `/tasks` — active subagents and shell commands in this Copilot session
+- `/tasks` — show gateway-visible active tool calls and queued prompts
 - `/help` — list commands
 
 Tool permission requests appear as **Approve / Deny buttons** in the thread
 (`APPROVAL_MODE=buttons`, the default). Set `APPROVAL_MODE=auto` to run
 Copilot with `--allow-all-*` flags instead (yolo).
+
+`/tasks` is handled locally because Copilot's interactive `/tasks` command is
+not available through the ACP interface. It reports the current session state
+and active ACP tool calls without sending the command to Copilot as a prompt.
 
 ## Configuration
 

@@ -215,7 +215,7 @@ HELP_TEXT = """*copilot-slack-gateway commands*
 • `/<skill> [args]` — invoke one of your Copilot skills (registered ones autocomplete)
 • `/new` — discard this thread's Copilot session and start fresh
 • `/stop` — cancel the currently running prompt
-• `/tasks` — show active subagents and shell commands in this Copilot session
+• `/tasks` — show gateway-visible active tasks without prompting Copilot
 • `/help` — this message
 """
 
@@ -225,6 +225,34 @@ def skill_invocation_prompt(name: str, args: str) -> str:
     if args:
         prompt += f"\n\nSkill arguments:\n{args}"
     return prompt
+
+
+def format_task_status(status: dict[str, Any]) -> str:
+    """Render gateway-visible ACP work without invoking the Copilot model."""
+    session_id = status.get("session_id")
+    if not session_id:
+        return "📋 *Tasks*\nNo active Copilot session in this conversation."
+
+    state = "running" if status.get("busy") else "idle"
+    pid = status.get("pid")
+    lines = [f"📋 *Tasks* — session `{session_id}` ({state})"]
+    if pid:
+        lines[0] += f", pid `{pid}`"
+    queued = int(status.get("queued") or 0)
+    if queued:
+        lines.append(f"• Queued prompts: {queued}")
+    tasks = status.get("tasks") or []
+    if tasks:
+        lines.append("• Active tool calls:")
+        for task in tasks:
+            title = " ".join(str(task.get("title") or "tool").split())
+            task_status = " ".join(str(task.get("status") or "running").split())
+            lines.append(f"  • {title} — {task_status}")
+    elif status.get("busy"):
+        lines.append("• Copilot is processing the current prompt.")
+    else:
+        lines.append("• No active subagents or shell commands.")
+    return "\n".join(lines)
 
 
 def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionManager]:
@@ -360,11 +388,11 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                 await post(reply_conv, HELP_TEXT)
                 return
             if command == "/tasks":
-                # `/tasks` is a native Copilot ACP command, not a skill invocation.
-                text = f"{command} {arg}".strip()
-            else:
-                # Not a gateway command — treat as a Copilot skill invocation.
-                text = skill_invocation_prompt(command.lstrip("/"), arg)
+                # Copilot's interactive /tasks is unavailable over ACP; keep this local.
+                await post(reply_conv, format_task_status(registry.task_status(key)))
+                return
+            # Not a gateway command — treat as a Copilot skill invocation.
+            text = skill_invocation_prompt(command.lstrip("/"), arg)
         conv, fresh = await registry.get_or_create(
             key,
             channel=channel,

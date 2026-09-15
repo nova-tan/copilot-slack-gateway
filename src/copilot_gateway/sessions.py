@@ -139,6 +139,19 @@ class SessionRegistry:
             return True
         return False
 
+    def task_status(self, key: str) -> dict[str, Any]:
+        """Return gateway-visible work for a conversation without prompting Copilot."""
+        conv = self._conversations.get(key)
+        if conv is None or conv.session is None or not conv.session.alive:
+            return {"session_id": None, "pid": None, "busy": False, "queued": 0, "tasks": []}
+        return {
+            "session_id": conv.session.session_id,
+            "pid": conv.session.pid,
+            "busy": conv.session.busy(),
+            "queued": conv.queue.qsize(),
+            "tasks": conv.session.active_tasks(),
+        }
+
     async def close_all(self) -> None:
         async with self._lock:
             for conv in self._conversations.values():
