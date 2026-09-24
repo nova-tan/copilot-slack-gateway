@@ -256,20 +256,25 @@ class StreamRenderer:
             kwargs.setdefault("thread_ts", self.thread_ts)
         return await self.client.chat_postMessage(channel=self.channel, text=text, **kwargs)
 
-    def _cancel_blocks(self) -> list[dict]:
-        return [{
-            "type": "actions",
-            "elements": [{
-                "type": "button",
-                "text": {"type": "plain_text", "text": "🛑 Cancel"},
-                "action_id": "cancel_turn",
-                "value": self.conv_key,
-                "style": "danger",
-            }],
-        }]
+    def _live_blocks(self, text: str) -> list[dict]:
+        # With blocks present, `text` is only a notification fallback — the
+        # visible body must be a section block.
+        return [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {
+                "type": "actions",
+                "elements": [{
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🛑 Cancel"},
+                    "action_id": "cancel_turn",
+                    "value": self.conv_key,
+                    "style": "danger",
+                }],
+            },
+        ]
 
     async def start(self) -> None:
-        resp = await self._post("⏳ Working…", blocks=self._cancel_blocks())
+        resp = await self._post("⏳ Working…", blocks=self._live_blocks("⏳ Working…"))
         self.message_ts = resp["ts"]
 
     def _render_live(self) -> str:
@@ -295,7 +300,7 @@ class StreamRenderer:
         with contextlib.suppress(Exception):
             await self.client.chat_update(
                 channel=self.channel, ts=self.message_ts, text=self._render_live(),
-                blocks=self._cancel_blocks(),
+                blocks=self._live_blocks(self._render_live()),
             )
 
     async def add_text(self, chunk: str) -> None:
