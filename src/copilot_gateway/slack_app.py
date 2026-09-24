@@ -237,11 +237,13 @@ Ask in this channel when a user decision is required."""
 class StreamRenderer:
     """Renders one prompt's streamed output into Slack messages."""
 
-    def __init__(self, client, channel: str, thread_ts: str | None, show_thoughts: bool) -> None:
+    def __init__(self, client, channel: str, thread_ts: str | None, show_thoughts: bool,
+                 conv_key: str) -> None:
         self.client = client
         self.channel = channel
         self.thread_ts = thread_ts  # None => top-level posts (DM conversations)
         self.show_thoughts = show_thoughts
+        self.conv_key = conv_key
         self.text_parts: list[str] = []
         self.thought_parts: list[str] = []
         self.tool_lines: list[str] = []
@@ -254,8 +256,20 @@ class StreamRenderer:
             kwargs.setdefault("thread_ts", self.thread_ts)
         return await self.client.chat_postMessage(channel=self.channel, text=text, **kwargs)
 
+    def _cancel_blocks(self) -> list[dict]:
+        return [{
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🛑 Cancel"},
+                "action_id": "cancel_turn",
+                "value": self.conv_key,
+                "style": "danger",
+            }],
+        }]
+
     async def start(self) -> None:
-        resp = await self._post("⏳ Working…")
+        resp = await self._post("⏳ Working…", blocks=self._cancel_blocks())
         self.message_ts = resp["ts"]
 
     def _render_live(self) -> str:
@@ -280,7 +294,8 @@ class StreamRenderer:
         self._last_edit = now
         with contextlib.suppress(Exception):
             await self.client.chat_update(
-                channel=self.channel, ts=self.message_ts, text=self._render_live()
+                channel=self.channel, ts=self.message_ts, text=self._render_live(),
+                blocks=self._cancel_blocks(),
             )
 
     async def add_text(self, chunk: str) -> None:
@@ -311,7 +326,8 @@ class StreamRenderer:
         chunks = chunk_text(full)
         if self.message_ts:
             with contextlib.suppress(Exception):
-                await self.client.chat_update(channel=self.channel, ts=self.message_ts, text=chunks[0])
+                await self.client.chat_update(
+                    channel=self.channel, ts=self.message_ts, text=chunks[0], blocks=[])
             chunks = chunks[1:]
         for chunk in chunks:
             await self._post(chunk)
@@ -405,7 +421,7 @@ HELP_TEXT = """*copilot-slack-gateway commands*
 • just type — talk to Copilot (reuses this thread's persistent session)
 • `/<skill> [args]` — invoke one of your Copilot skills (registered ones autocomplete)
 • `/new` — discard this conversation's Copilot session and start fresh
-• `/stop` — cancel the currently running prompt
+• `/stop` (or the 🛑 Cancel button on a working message) — cancel the currently running prompt
 • `/steer <info>` — interrupt the running prompt and fold new information into the task
 • `/tasks` — show gateway-visible active tasks without prompting Copilot
 • `/stream-channel [description or GitHub issue URL]` — create or reuse a dedicated stream channel
@@ -518,10 +534,20 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
         original = body.get("message", {}).get("text", "Permission request")
         await respond(text=f"{original}\n— _{label} by <@{body['user']['id']}>_" if resolved else f"{original}\n— _(already resolved)_")
 
+    @app.action("cancel_turn")
+    async def handle_cancel_turn(ack, body, respond):
+        await ack()
+        if not authorized((body.get("user") or {}).get("id")):
+            return
+        key = str((body.get("actions") or [{}])[0].get("value") or "")
+        if not await registry.cancel(key):
+            await respond(response_type="ephemeral", text="Nothing is running here.")
+
     # ----------------------------------------------------------- prompt flow
 
     async def run_prompt(conv: Conversation, text: str) -> None:
-        renderer = StreamRenderer(app.client, conv.channel, conv.thread_ts, config.show_thoughts)
+        renderer = StreamRenderer(app.client, conv.channel, conv.thread_ts, config.show_thoughts,
+                                  conv.key)
         conv.renderer = renderer
         error: str | None = None
         try:
