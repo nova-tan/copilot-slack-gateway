@@ -1,9 +1,9 @@
 """Conversation -> persistent ACP session registry.
 
-Each Slack conversation (a DM thread, or a channel thread started by an
-@mention) gets its own long-lived Copilot session. Sessions are recycled when
-they exceed MAX_SESSION_AGE_HOURS (the "daily rollover") or when their process
-has died.
+Each Slack conversation (a DM, a channel thread started by an @mention, or a
+managed stream channel) gets its own long-lived Copilot session. Sessions are
+recycled when they exceed MAX_SESSION_AGE_HOURS (the "daily rollover") or when
+their process has died.
 """
 
 from __future__ import annotations
@@ -43,18 +43,117 @@ class SessionRegistry:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._conversations: dict[str, Conversation] = {}
+        self._stream_channels: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        self._load_stream_channels()
 
     @staticmethod
-    def key_for(channel: str, thread_ts: str | None, *, is_dm: bool = False) -> str:
+    def key_for(
+        channel: str,
+        thread_ts: str | None,
+        *,
+        is_dm: bool = False,
+        is_stream: bool = False,
+    ) -> str:
         # A DM is one long-lived conversation (top-level replies); a channel
-        # conversation is scoped to the thread the bot was mentioned in.
-        return channel if is_dm else f"{channel}:{thread_ts}"
+        # conversation is scoped to the thread the bot was mentioned in. A
+        # managed stream channel is one long-lived conversation for the whole
+        # channel.
+        if is_dm or is_stream:
+            return channel
+        return f"{channel}:{thread_ts}"
 
     @property
     def _state_path(self) -> Path:
         return self.config.state_dir / "state.json"
+
+    @property
+    def _stream_channels_path(self) -> Path:
+        return self.config.state_dir / "stream_channels.json"
+
+    def _load_stream_channels(self) -> None:
+        try:
+            payload = json.loads(self._stream_channels_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("unable to load stream channel state from %s: %s", self._stream_channels_path, exc)
+            return
+
+        entries = payload.get("streams") if isinstance(payload, dict) else None
+        if not isinstance(entries, dict):
+            logger.warning("ignoring invalid stream channel state in %s", self._stream_channels_path)
+            return
+
+        for stream_id, record in entries.items():
+            if not isinstance(stream_id, str) or not isinstance(record, dict):
+                continue
+            channel_id = record.get("channel_id")
+            name = record.get("name")
+            description = record.get("description")
+            if (
+                not isinstance(channel_id, str)
+                or not isinstance(name, str)
+                or not isinstance(description, str)
+            ):
+                logger.warning("ignoring invalid stream channel record %r", stream_id)
+                continue
+            self._stream_channels[stream_id] = dict(record)
+
+    def _save_stream_channels(self) -> None:
+        payload = {"version": 1, "streams": self._stream_channels}
+        tmp = self._stream_channels_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self._stream_channels_path)
+
+    def get_stream_channel(self, stream_id: str) -> dict[str, Any] | None:
+        record = self._stream_channels.get(stream_id)
+        return dict(record) if record is not None else None
+
+    def get_stream_channel_by_slack_id(self, channel_id: str) -> dict[str, Any] | None:
+        for record in self._stream_channels.values():
+            if record.get("channel_id") == channel_id:
+                return dict(record)
+        return None
+
+    def is_stream_channel(self, channel_id: str) -> bool:
+        return self.get_stream_channel_by_slack_id(channel_id) is not None
+
+    def register_stream_channel(
+        self,
+        *,
+        stream_id: str,
+        channel_id: str,
+        name: str,
+        description: str,
+        created_by: str,
+    ) -> dict[str, Any]:
+        existing = self._stream_channels.get(stream_id)
+        if existing is not None:
+            if existing.get("channel_id") != channel_id:
+                raise RuntimeError(
+                    f"stream {stream_id!r} is already registered to Slack channel "
+                    f"{existing.get('channel_id')!r}"
+                )
+            return dict(existing)
+        for existing_id, record in self._stream_channels.items():
+            if record.get("channel_id") == channel_id:
+                raise RuntimeError(
+                    f"Slack channel {channel_id!r} is already registered to stream {existing_id!r}"
+                )
+
+        record = {
+            "stream_id": stream_id,
+            "channel_id": channel_id,
+            "name": name,
+            "description": description,
+            "created_by": created_by,
+            "created_at": time.time(),
+        }
+        self._stream_channels[stream_id] = record
+        self._save_stream_channels()
+        return dict(record)
 
     def load_metadata(self) -> dict[str, Any]:
         try:
@@ -112,6 +211,7 @@ class SessionRegistry:
                     args=self.config.copilot_args,
                     cwd=conv.cwd,
                     model=self.config.model,
+                    mcp_servers=self.config.mcp_servers,
                     on_event=on_event_factory(conv),
                     permission_handler=permission_handler_factory(conv),
                     prompt_timeout=self.config.prompt_timeout_seconds,
@@ -139,6 +239,31 @@ class SessionRegistry:
             return True
         return False
 
+    async def steer(self, key: str, text: str) -> bool:
+        """Interrupt the in-flight prompt and run `text` next, ahead of queued prompts.
+
+        The session keeps its full history (including the partial turn), so the
+        follow-up prompt can fold the new information into the ongoing task.
+        Returns False when the conversation has no busy session to steer.
+        """
+        conv = self._conversations.get(key)
+        if conv is None or conv.session is None or not conv.session.busy():
+            return False
+        await conv.session.cancel()
+        pending: list[str] = []
+        while True:
+            try:
+                pending.append(conv.queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        conv.queue.put_nowait(text)
+        for item in pending:
+            conv.queue.put_nowait(item)
+        return True
+
+    def get_conversation(self, key: str) -> Conversation | None:
+        return self._conversations.get(key)
+
     def task_status(self, key: str) -> dict[str, Any]:
         """Return gateway-visible work for a conversation without prompting Copilot."""
         conv = self._conversations.get(key)
@@ -151,6 +276,10 @@ class SessionRegistry:
             "queued": conv.queue.qsize(),
             "tasks": conv.session.active_tasks(),
         }
+
+    def has_session(self, key: str) -> bool:
+        conv = self._conversations.get(key)
+        return conv is not None and conv.session is not None
 
     async def close_all(self) -> None:
         async with self._lock:

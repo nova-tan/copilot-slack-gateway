@@ -6,12 +6,12 @@ and drives a persistent `copilot --acp --stdio` process via the Agent Client
 Protocol.
 
 ```
-Slack (DM or @mention thread)
+Slack (DM, @mention thread, or managed stream channel)
       │  Socket Mode (outbound)
       ▼
 copilot-slack-gateway  ── spawns/owns ──▶  copilot --acp --stdio
       │  JSON-RPC over stdio (ACP)         one process + one ACP session
-      ▼                                    per Slack thread, reused all day
+      ▼                                    per conversation, reused all day
 streamed replies + permission buttons ◀── session/update, request_permission
 ```
 
@@ -38,6 +38,8 @@ streamed replies + permission buttons ◀── session/update, request_permissi
 2. **Enable Socket Mode**: *Settings → Socket Mode* → enable, generate an
    app-level token (`xapp-...`) with `connections:write`.
 3. **Install to workspace** and copy the bot token (`xoxb-...`).
+   Reinstall the app after changing the manifest so the channel-management
+   scopes and `message.channels` subscription take effect.
 4. Configure:
 
    ```bash
@@ -66,10 +68,35 @@ update it.
 DM the bot (or @mention it in a channel — replies stay in the thread):
 
 - just type — talk to Copilot
-- `/new` — discard this thread's session, start fresh
+- `/new` — discard this conversation's session, start fresh
 - `/stop` — cancel the running prompt
+- `/steer <info>` — interrupt the running prompt and fold new information into
+  the task (the session keeps its history, so the agent continues with your
+  update in context; jumps ahead of any queued messages)
 - `/tasks` — show gateway-visible active tool calls and queued prompts
 - `/help` — list commands
+
+Create a dedicated channel for a long-lived stream from a DM or any channel
+where the command is available:
+
+```text
+/stream-channel [stream description or GitHub issue URL]
+```
+
+The gateway derives a stable stream id, creates (or reuses a registered) public
+`stream-<id>` channel, invites the requester, persists the channel mapping,
+and starts one primary Copilot session for the whole channel. Messages in a
+managed stream channel are routed to that session without requiring an
+`@mention`; use threads only for human discussion, not for creating additional
+Copilot sessions.
+
+The argument is optional. With no argument, the gateway creates a unique
+provisional channel and the Copilot session asks what the stream should work
+on. Supplying an issue URL or description is preferable when you want a stable,
+recognizable channel that can be reused by repeating the command.
+
+The command is deliberately separate from `/stream`, which remains the
+Copilot skill invocation for the existing OMG stream workflow.
 
 Tool permission requests appear as **Approve / Deny buttons** in the thread
 (`APPROVAL_MODE=buttons`, the default). Set `APPROVAL_MODE=auto` to run
@@ -86,6 +113,7 @@ See `.env.example`. Notables:
 | Var | Default | Purpose |
 |---|---|---|
 | `ALLOWED_USERS` | _(empty)_ | Comma-separated Slack user IDs allowed to use the bot. Empty denies all users. **Set this.** |
+| `SLACK_WORKSPACE_URL` | `https://wesdigital.slack.com` | Workspace base URL used for stream channel links |
 | `GATEWAY_CWD` | `~` | Working dir for all Copilot sessions; ACP fs bridge is confined here |
 | `COPILOT_MODEL` | CLI default | Optional model ID supported by your Copilot CLI |
 | `MAX_SESSION_AGE_HOURS` | `18` | "Daily rollover" threshold |
@@ -99,7 +127,7 @@ See `.env.example`. Notables:
 
 ## Limitations
 
-- One prompt at a time per thread; messages sent while busy are queued FIFO.
+- One prompt at a time per conversation; messages sent while busy are queued FIFO.
 - Session history lives in the Copilot process; a gateway restart starts a
   fresh Copilot session (Slack history remains for humans).
 - File access via the ACP fs bridge is confined to `GATEWAY_CWD`.

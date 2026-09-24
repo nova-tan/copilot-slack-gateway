@@ -89,6 +89,7 @@ class ACPSession:
         args: tuple[str, ...],
         cwd: str,
         model: str | None,
+        mcp_servers: list[dict[str, Any]] | None = None,
         on_event: EventCallback,
         permission_handler: PermissionHandler,
         prompt_timeout: float = 3600.0,
@@ -97,6 +98,7 @@ class ACPSession:
         self.args = args
         self.cwd = cwd
         self.model = model
+        self.mcp_servers = list(mcp_servers or [])
         self.on_event = on_event
         self.permission_handler = permission_handler
         self.prompt_timeout = prompt_timeout
@@ -172,7 +174,7 @@ class ACPSession:
         self._stderr_task = asyncio.create_task(self._stderr_loop(), name=f"acp-stderr-{self.pid}")
 
         await self._request("initialize", _INITIALIZE_PARAMS)
-        session = await self._request("session/new", {"cwd": self.cwd, "mcpServers": []})
+        session = await self._request("session/new", {"cwd": self.cwd, "mcpServers": self.mcp_servers})
         self.session_id = str(session.get("sessionId") or "").strip()
         if not self.session_id:
             raise SessionDeadError("session/new did not return a sessionId.")

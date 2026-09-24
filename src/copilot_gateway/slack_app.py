@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -13,6 +14,7 @@ from typing import Any
 
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+from slack_sdk.errors import SlackApiError
 
 from .acp import ACPSession, SessionDeadError
 from .config import Config
@@ -26,6 +28,14 @@ FINAL_CHUNK_LIMIT = 3500
 _SEEN_IDS_MAX = 5000
 DENY_VALUE = "__deny__"
 PERM_ACTION_ID = "perm_decision"
+STREAM_CHANNEL_COMMAND = "/stream-channel"
+STREAM_CHANNEL_PREFIX = "stream-"
+STREAM_CHANNEL_MAX_LENGTH = 80
+PROVISIONAL_STREAM_DESCRIPTION = "Awaiting stream description from the user."
+GITHUB_ISSUE_RE = re.compile(
+    r"https?://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)(?:[/?#\s]|$)",
+    re.IGNORECASE,
+)
 
 
 def chunk_text(text: str, limit: int = FINAL_CHUNK_LIMIT) -> list[str]:
@@ -41,6 +51,68 @@ def chunk_text(text: str, limit: int = FINAL_CHUNK_LIMIT) -> list[str]:
     if remaining or not chunks:
         chunks.append(remaining)
     return chunks
+
+
+def stream_id_from_text(text: str) -> str:
+    """Derive a stable stream id from an issue URL or free-form work item."""
+    value = text.strip()
+    if not value:
+        raise ValueError("provide a stream description or GitHub issue URL")
+
+    issue = GITHUB_ISSUE_RE.search(value)
+    source = (
+        f"{issue.group(1)}-{issue.group(2)}-issue-{issue.group(3)}"
+        if issue
+        else value
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    if not slug:
+        raise ValueError("the stream description must contain letters or numbers")
+
+    max_id_length = STREAM_CHANNEL_MAX_LENGTH - len(STREAM_CHANNEL_PREFIX)
+    if len(slug) > max_id_length:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+        slug = f"{slug[:max_id_length - len(digest) - 1].rstrip('-')}-{digest}"
+    return slug
+
+
+def stream_channel_name(stream_id: str) -> str:
+    return f"{STREAM_CHANNEL_PREFIX}{stream_id}"[:STREAM_CHANNEL_MAX_LENGTH].rstrip("-")
+
+
+def provisional_stream_id() -> str:
+    return f"new-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def stream_kickoff_prompt(
+    stream_id: str,
+    channel_name: str,
+    description: str | None,
+) -> str:
+    if description and description != PROVISIONAL_STREAM_DESCRIPTION:
+        request_context = f"""Stream request:
+{description}
+
+Start by reconciling this request with the existing OMG stream state, then
+create or update the stream record directly with the available OMG tools and
+continue through the appropriate planning, implementation, and verification
+gates."""
+    else:
+        request_context = """No stream request was supplied yet. Ask the user
+to describe what this stream should work on, then create or update the OMG
+stream record and continue through the appropriate planning, implementation,
+and verification gates."""
+
+    return f"""You are the primary Copilot session for Slack stream `{stream_id}` in `#{channel_name}`.
+
+Work directly in this session and keep the user updated in the channel. Do not
+create another Slack channel or launch a subagent merely to own this stream;
+use subagents only when parallel or long-running work genuinely benefits from
+them.
+
+{request_context}
+
+Ask in this channel when a user decision is required."""
 
 
 class StreamRenderer:
@@ -208,14 +280,16 @@ class PermissionManager:
         return True
 
 
-RESERVED_COMMANDS = {"/new", "/stop", "/tasks", "/help"}
+RESERVED_COMMANDS = {"/new", "/stop", "/steer", "/tasks", "/help", STREAM_CHANNEL_COMMAND}
 
 HELP_TEXT = """*copilot-slack-gateway commands*
 • just type — talk to Copilot (reuses this thread's persistent session)
 • `/<skill> [args]` — invoke one of your Copilot skills (registered ones autocomplete)
-• `/new` — discard this thread's Copilot session and start fresh
+• `/new` — discard this conversation's Copilot session and start fresh
 • `/stop` — cancel the currently running prompt
+• `/steer <info>` — interrupt the running prompt and fold new information into the task
 • `/tasks` — show gateway-visible active tasks without prompting Copilot
+• `/stream-channel [description or GitHub issue URL]` — create or reuse a dedicated stream channel
 • `/help` — this message
 """
 
@@ -225,6 +299,13 @@ def skill_invocation_prompt(name: str, args: str) -> str:
     if args:
         prompt += f"\n\nSkill arguments:\n{args}"
     return prompt
+
+
+def steer_prompt(text: str) -> str:
+    return (
+        "The user interrupted with additional information while you were working. "
+        "Incorporate it and continue the task:\n\n" + text
+    )
 
 
 def format_task_status(status: dict[str, Any]) -> str:
@@ -363,16 +444,137 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             await post(conv, f"⏳ Still working — your message is queued (position {depth + 1}).")
         conv.queue.put_nowait(text)
 
-    async def handle_text(text: str, channel: str, thread_ts: str | None, user: str, *, is_dm: bool) -> None:
+    async def ensure_stream_channel(
+        stream_request: str,
+        user: str,
+    ) -> tuple[dict[str, Any], bool, str | None]:
+        stream_request = stream_request.strip()
+        stream_id = stream_id_from_text(stream_request) if stream_request else provisional_stream_id()
+        channel_name = stream_channel_name(stream_id)
+        record = registry.get_stream_channel(stream_id)
+        created = False
+
+        if record is None:
+            try:
+                response = await app.client.conversations_create(
+                    name=channel_name,
+                    is_private=False,
+                )
+            except SlackApiError as exc:
+                error = str(exc.response.get("error") or "unknown_error")
+                if error == "name_taken":
+                    raise RuntimeError(
+                        f"Slack channel `{channel_name}` already exists but is not registered "
+                        "as a Copilot stream; refusing to take it over."
+                    ) from exc
+                raise
+
+            channel = response.get("channel") or {}
+            channel_id = str(channel.get("id") or "")
+            if not channel_id:
+                raise RuntimeError("Slack did not return the id of the new stream channel.")
+            record = registry.register_stream_channel(
+                stream_id=stream_id,
+                channel_id=channel_id,
+                name=str(channel.get("name") or channel_name),
+                description=stream_request or PROVISIONAL_STREAM_DESCRIPTION,
+                created_by=user,
+            )
+            created = True
+
+        invitation_error: str | None = None
+        try:
+            await app.client.conversations_invite(
+                channel=str(record["channel_id"]),
+                users=user,
+            )
+        except SlackApiError as exc:
+            error = str(exc.response.get("error") or "unknown_error")
+            if error not in {"already_in_channel", "is_archived"}:
+                invitation_error = error
+                logger.warning(
+                    "unable to invite %s to stream channel %s: %s",
+                    user,
+                    record["channel_id"],
+                    error,
+                )
+        return record, created, invitation_error
+
+    async def start_stream_channel(stream_request: str | None, user: str) -> str:
+        stream_request = (stream_request or "").strip()
+        record, created, invitation_error = await ensure_stream_channel(stream_request, user)
+        channel_id = str(record["channel_id"])
+        channel_name = str(record["name"])
+        key = SessionRegistry.key_for(channel_id, None, is_stream=True)
+        had_session = registry.has_session(key)
+        conv, recycled = await registry.get_or_create(
+            key,
+            channel=channel_id,
+            thread_ts=None,
+            on_event_factory=make_on_event,
+            permission_handler_factory=make_permission_handler,
+        )
+
+        if created:
+            request_text = (
+                f"Request: {record['description']}"
+                if record["description"] != PROVISIONAL_STREAM_DESCRIPTION
+                else "Tell Copilot what this stream should work on."
+            )
+            await app.client.chat_postMessage(
+                channel=channel_id,
+                text=(
+                    f"🚀 *Copilot stream `{record['stream_id']}` is ready*\n"
+                    f"{request_text}\n\n"
+                    "Send messages in this channel to continue the stream. "
+                    "This channel is the primary Copilot session."
+                ),
+            )
+
+        started = created or recycled or not had_session
+        if started:
+            await dispatch_prompt(
+                conv,
+                stream_kickoff_prompt(
+                    str(record["stream_id"]),
+                    channel_name,
+                    str(record["description"]),
+                ),
+                recycled,
+            )
+
+        link = f"{config.slack_workspace_url}/archives/{channel_id}"
+        status = "started" if started else "already active"
+        result = f"🚀 Stream `{record['stream_id']}` {status}: <{link}|#{channel_name}>"
+        if invitation_error:
+            result += f"\n⚠️ I could not invite you to the channel (`{invitation_error}`)."
+        return result
+
+    async def handle_text(
+        text: str,
+        channel: str,
+        thread_ts: str | None,
+        user: str,
+        *,
+        is_dm: bool,
+        is_stream: bool = False,
+    ) -> None:
         text = text.strip()
         if not text:
             return
-        key = SessionRegistry.key_for(channel, thread_ts, is_dm=is_dm)
-        reply_thread = None if is_dm else thread_ts
+        key = SessionRegistry.key_for(channel, thread_ts, is_dm=is_dm, is_stream=is_stream)
+        reply_thread = None if is_dm or is_stream else thread_ts
         reply_conv = Conversation(key=key, channel=channel, thread_ts=reply_thread, cwd=config.cwd)
         if text.startswith("/"):
             command, _, arg = text.partition(" ")
             command, arg = command.lower(), arg.strip()
+            if command == STREAM_CHANNEL_COMMAND:
+                try:
+                    await post(reply_conv, await start_stream_channel(arg or None, user))
+                except (RuntimeError, SlackApiError, ValueError) as exc:
+                    logger.exception("stream channel creation failed")
+                    await post(reply_conv, f"⚠️ Could not create the stream channel: {exc}")
+                return
             if command == "/new":
                 dropped = await registry.reset(key)
                 await post(reply_conv,
@@ -384,6 +586,21 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                 await post(reply_conv,
                     "🛑 Cancellation sent." if cancelled else "Nothing is running here.")
                 return
+            if command == "/steer":
+                if not arg:
+                    await post(reply_conv,
+                        "Usage: `/steer <info>` — interrupt the running task and fold in new information.")
+                    return
+                if await registry.steer(key, steer_prompt(arg)):
+                    steered_conv = registry.get_conversation(key)
+                    if steered_conv is not None and (steered_conv.worker is None or steered_conv.worker.done()):
+                        steered_conv.worker = asyncio.create_task(
+                            worker(steered_conv), name=f"worker-{steered_conv.key}")
+                    await post(reply_conv, "🌀 Interrupted the current turn — folding in your update.")
+                    return
+                # Nothing in flight — send it as a normal message.
+                text = arg
+                command = ""
             if command == "/help":
                 await post(reply_conv, HELP_TEXT)
                 return
@@ -392,7 +609,8 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                 await post(reply_conv, format_task_status(registry.task_status(key)))
                 return
             # Not a gateway command — treat as a Copilot skill invocation.
-            text = skill_invocation_prompt(command.lstrip("/"), arg)
+            if command:
+                text = skill_invocation_prompt(command.lstrip("/"), arg)
         conv, fresh = await registry.get_or_create(
             key,
             channel=channel,
@@ -408,16 +626,24 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
     async def on_message(event, say):
         if event.get("subtype") or event.get("bot_id"):
             return
-        if event.get("channel_type") != "im":
+        if not authorized(event.get("user")):
             return
-        if not authorized(event.get("user")) or already_seen(event):
+        channel_type = event.get("channel_type")
+        is_dm = channel_type == "im"
+        is_stream = channel_type == "channel" and registry.is_stream_channel(event.get("channel", ""))
+        if not is_dm and not is_stream:
+            return
+        if already_seen(event):
             return
         await handle_text(
-            event.get("text") or "",
+            re.sub(r"<@[A-Z0-9]+>", "", event.get("text") or "", count=1).strip()
+            if is_stream
+            else event.get("text") or "",
             event["channel"],
-            event.get("thread_ts") or event["ts"],
+            (event.get("thread_ts") or event["ts"]) if is_dm else None,
             event["user"],
-            is_dm=True,
+            is_dm=is_dm,
+            is_stream=is_stream,
         )
 
     @app.command(re.compile(r"^/[a-z0-9][a-z0-9_-]*$"))
@@ -426,24 +652,46 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
         if not authorized(command.get("user_id")):
             return
         is_dm = command.get("channel_name") == "directmessage"
-        if not is_dm:
+        is_stream = registry.is_stream_channel(command["channel_id"])
+        command_name = str(command["command"]).lower()
+        command_text = str(command.get("text") or "").strip()
+        if command_name == STREAM_CHANNEL_COMMAND:
+            try:
+                await respond(
+                    response_type="ephemeral",
+                    text=await start_stream_channel(command_text or None, command["user_id"]),
+                )
+            except (RuntimeError, SlackApiError, ValueError) as exc:
+                logger.exception("stream channel slash command failed")
+                await respond(response_type="ephemeral", text=f"⚠️ Could not create the stream channel: {exc}")
+            return
+        if not is_dm and not is_stream:
             await respond(response_type="ephemeral",
                           text="Run skills in a DM with me, or @mention me in a thread.")
             return
-        text = f"{command['command']} {command.get('text') or ''}".strip()
-        await handle_text(text, command["channel_id"], None, command["user_id"], is_dm=True)
+        text = f"{command['command']} {command_text}".strip()
+        await handle_text(
+            text,
+            command["channel_id"],
+            None,
+            command["user_id"],
+            is_dm=is_dm,
+            is_stream=is_stream,
+        )
 
     @app.event("app_mention")
     async def on_mention(event, say):
         if not authorized(event.get("user")) or already_seen(event):
             return
         text = re.sub(r"<@[A-Z0-9]+>", "", event.get("text") or "", count=1).strip()
+        is_stream = registry.is_stream_channel(event["channel"])
         await handle_text(
             text,
             event["channel"],
-            event.get("thread_ts") or event["ts"],
+            (event.get("thread_ts") or event["ts"]) if not is_stream else None,
             event["user"],
             is_dm=False,
+            is_stream=is_stream,
         )
 
     return app, registry, permissions

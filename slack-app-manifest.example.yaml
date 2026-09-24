@@ -25,10 +25,18 @@ features:
         description: "Cancel the active Copilot prompt"
         should_escape: false
         usage_hint: "[args]"
+      - command: /steer
+        description: "Interrupt the running prompt and fold new information into the task"
+        should_escape: false
+        usage_hint: "<new information>"
       - command: /tasks
         description: "Show active subagents and shell commands in this Copilot session"
         should_escape: false
         usage_hint: "[args]"
+      - command: /stream-channel
+        description: "Create or reuse a dedicated Slack channel for a Copilot stream"
+        should_escape: false
+        usage_hint: "[optional description or GitHub issue URL]"
       - command: /help
         description: "Show gateway usage help"
         should_escape: false
@@ -38,6 +46,10 @@ oauth_config:
     bot:
       - app_mentions:read
       - chat:write
+      - channels:history
+      - channels:manage
+      - channels:read
+      - channels:write.invites
       - commands
       - im:history
       - im:read
@@ -47,6 +59,7 @@ settings:
   event_subscriptions:
     bot_events:
       - app_mention
+      - message.channels
       - message.im
   interactivity:
     is_enabled: true
