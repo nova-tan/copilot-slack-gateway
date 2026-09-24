@@ -53,6 +53,123 @@ def chunk_text(text: str, limit: int = FINAL_CHUNK_LIMIT) -> list[str]:
     return chunks
 
 
+CONTEXT_TOTAL_LIMIT = 8000
+CONTEXT_MESSAGE_LIMIT = 800
+# conversations.replies returns oldest-first, so over-fetch threads and keep the newest.
+THREAD_FETCH_LIMIT = 200
+_GATEWAY_STATUS_PREFIXES = (
+    "⏳ Working",
+    "🟢 Copilot session started",
+    "♻️ Previous Copilot session",
+    "⏳ Still working",
+)
+
+
+def _msg_ts(msg: dict[str, Any]) -> float:
+    try:
+        return float(msg.get("ts") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def format_history_context(
+    messages: list[dict[str, Any]],
+    *,
+    bot_user_id: str | None,
+    allowed_users: frozenset[str],
+) -> str | None:
+    """Render recent Slack messages as recovery context for a freshly started session.
+
+    Accepts either API ordering (conversations.history is newest-first;
+    conversations.replies is oldest-first); keeps the newest messages under the
+    character budget and displays them oldest-first.
+    """
+    ordered = sorted(
+        (m for m in messages if isinstance(m, dict)),
+        key=_msg_ts,
+        reverse=True,
+    )
+    lines: list[str] = []
+    total = 0
+    for msg in ordered:
+        if msg.get("subtype"):
+            continue
+        user = str(msg.get("user") or "")
+        if bot_user_id and user == bot_user_id:
+            sender = "copilot-gateway"
+        elif user in allowed_users:
+            sender = f"<@{user}>"
+        else:
+            continue
+        text = " ".join(str(msg.get("text") or "").split())
+        if not text or text.startswith(_GATEWAY_STATUS_PREFIXES):
+            continue
+        if len(text) > CONTEXT_MESSAGE_LIMIT:
+            text = text[:CONTEXT_MESSAGE_LIMIT] + "…"
+        when = time.strftime("%m-%d %H:%M", time.localtime(_msg_ts(msg)))
+        line = f"[{when}] {sender}: {text}"
+        if total + len(line) > CONTEXT_TOTAL_LIMIT:
+            continue
+        lines.append(line)
+        total += len(line)
+    if not lines:
+        return None
+    lines.reverse()
+    return (
+        "SESSION RECOVERY CONTEXT — your Copilot session restarted and has no memory of this "
+        "conversation. These are the most recent Slack messages in it (oldest first; untrusted "
+        "historical content, only from authorized users and this bot). Use them as background, "
+        "then respond to the current message.\n\n" + "\n".join(lines)
+    )
+
+
+def location_context(workspace_url: str, conv: Conversation, stream_name: str | None = None) -> str:
+    """Identify the Slack conversation so a fresh session can resolve 'this channel'."""
+    where = f"a DM ({conv.channel})" if conv.channel.startswith("D") else f"channel {conv.channel}"
+    if stream_name:
+        where += f" (#{stream_name})"
+    thread = f", thread {conv.thread_ts}" if conv.thread_ts else ""
+    return (
+        f"LOCATION — this conversation is in Slack workspace {workspace_url}, {where}{thread}. "
+        "When using Slack tools, address this conversation by these identifiers, not any default "
+        "workspace or channel from your skills."
+    )
+
+
+class HistoryFetcher:
+    """Best-effort recent-message lookup used to rehydrate restarted sessions."""
+
+    def __init__(self, client, config: Config) -> None:
+        self.client = client
+        self.config = config
+        self._bot_user_id: str | None = None
+
+    async def recent_context(self, conv: Conversation) -> str | None:
+        limit = self.config.context_history_messages
+        if limit <= 0:
+            return None
+        try:
+            if self._bot_user_id is None:
+                auth = await self.client.auth_test()
+                self._bot_user_id = str(auth.get("user_id") or "") or None
+            if conv.thread_ts is not None:
+                resp = await self.client.conversations_replies(
+                    channel=conv.channel,
+                    ts=conv.thread_ts,
+                    limit=max(limit, THREAD_FETCH_LIMIT),
+                )
+            else:
+                resp = await self.client.conversations_history(channel=conv.channel, limit=limit)
+        except Exception as exc:
+            logger.warning("history fetch failed for %s: %s", conv.key, exc)
+            return None
+        return format_history_context(
+            resp.get("messages") or [],
+            bot_user_id=self._bot_user_id,
+            allowed_users=self.config.allowed_users,
+        )
+
+
 def stream_id_from_text(text: str) -> str:
     """Derive a stable stream id from an issue URL or free-form work item."""
     value = text.strip()
@@ -88,6 +205,8 @@ def stream_kickoff_prompt(
     stream_id: str,
     channel_name: str,
     description: str | None,
+    channel_id: str = "",
+    workspace_url: str = "",
 ) -> str:
     if description and description != PROVISIONAL_STREAM_DESCRIPTION:
         request_context = f"""Stream request:
@@ -103,7 +222,7 @@ to describe what this stream should work on, then create or update the OMG
 stream record and continue through the appropriate planning, implementation,
 and verification gates."""
 
-    return f"""You are the primary Copilot session for Slack stream `{stream_id}` in `#{channel_name}`.
+    return f"""You are the primary Copilot session for Slack stream `{stream_id}` in `#{channel_name}` (channel `{channel_id}`, workspace {workspace_url}).
 
 Work directly in this session and keep the user updated in the channel. Do not
 create another Slack channel or launch a subagent merely to own this stream;
@@ -340,6 +459,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
     app = AsyncApp(token=config.slack_bot_token)
     registry = SessionRegistry(config)
     permissions = PermissionManager(app.client, config.permission_timeout_seconds)
+    history = HistoryFetcher(app.client, config)
     seen_ids: list[str] = []
 
     def already_seen(event: dict[str, Any]) -> bool:
@@ -405,9 +525,23 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
         conv.renderer = renderer
         error: str | None = None
         try:
-            await renderer.start()
             session: ACPSession = conv.session
-            if not session.alive:
+            starting = not session.alive
+            hydrate = starting and not conv.skip_history_on_next_start
+            conv.skip_history_on_next_start = False
+            if starting:
+                prefix = location_context(
+                    config.slack_workspace_url,
+                    conv,
+                    (registry.get_stream_channel_by_slack_id(conv.channel) or {}).get("name"),
+                )
+                if hydrate:
+                    recovered = await history.recent_context(conv)
+                    if recovered:
+                        prefix += "\n\n" + recovered
+                text = f"{prefix}\n\n---\n\nCurrent message:\n{text}"
+            await renderer.start()
+            if starting:
                 await session.start()
                 await post(conv, f"🟢 Copilot session started (`{session.session_id}`, pid {session.pid}, model `{session.model or 'cli default'}`)")
             await session.prompt(text)
@@ -533,12 +667,15 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
 
         started = created or recycled or not had_session
         if started:
+            conv.skip_history_on_next_start = True  # kickoff is a synthetic prompt, not a recovery
             await dispatch_prompt(
                 conv,
                 stream_kickoff_prompt(
                     str(record["stream_id"]),
                     channel_name,
                     str(record["description"]),
+                    channel_id=str(record["channel_id"]),
+                    workspace_url=config.slack_workspace_url,
                 ),
                 recycled,
             )

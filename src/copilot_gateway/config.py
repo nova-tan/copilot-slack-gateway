@@ -11,6 +11,16 @@ from typing import Any
 from .env import load_local_env
 
 
+def _non_negative_int(raw: str, name: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a non-negative integer, got {raw!r}")
+    if value < 0:
+        raise SystemExit(f"{name} must be a non-negative integer, got {raw!r}")
+    return min(value, 1000)
+
+
 def _string_list(value: Any, *, field_name: str, server_name: str, path: Path) -> list[str]:
     if value is None:
         return []
@@ -111,6 +121,7 @@ class Config:
     show_thoughts: bool = False
     permission_timeout_seconds: float = 300.0
     prompt_timeout_seconds: float = 3600.0
+    context_history_messages: int = 30
     slack_workspace_url: str = "https://wesdigital.slack.com"
 
     @property
@@ -161,4 +172,7 @@ class Config:
             show_thoughts=os.environ.get("SHOW_THOUGHTS", "").strip().lower() in ("1", "true", "yes"),
             permission_timeout_seconds=float(os.environ.get("PERMISSION_TIMEOUT_SECONDS", "300")),
             prompt_timeout_seconds=float(os.environ.get("PROMPT_TIMEOUT_SECONDS", "3600")),
+            context_history_messages=_non_negative_int(
+                os.environ.get("CONTEXT_HISTORY_MESSAGES", "30"), "CONTEXT_HISTORY_MESSAGES"
+            ),
         )

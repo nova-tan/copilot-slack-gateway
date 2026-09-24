@@ -24,7 +24,9 @@ streamed replies + permission buttons ◀── session/update, request_permissi
 - **Crash recovery**: if the Copilot process exits, the gateway tells the
   thread and starts a fresh session on the next message.
 - **Gateway restarts**: Copilot child processes die with the gateway; threads
-  transparently get a fresh session on their next message.
+  transparently get a fresh session on their next message, rehydrated with the
+  conversation's workspace/channel identifiers and recent Slack history (see
+  `CONTEXT_HISTORY_MESSAGES`).
 
 ## Setup
 
@@ -117,6 +119,7 @@ See `.env.example`. Notables:
 | `GATEWAY_CWD` | `~` | Working dir for all Copilot sessions; ACP fs bridge is confined here |
 | `COPILOT_MODEL` | CLI default | Optional model ID supported by your Copilot CLI |
 | `MAX_SESSION_AGE_HOURS` | `18` | "Daily rollover" threshold |
+| `CONTEXT_HISTORY_MESSAGES` | `30` | Recent Slack messages injected as recovery context when a fresh session starts (0 disables). Not injected after `/new`. |
 | `COPILOT_RELAX_X509_STRICT` | `false` | Opt-in compatibility for enterprise TLS proxies with legacy certificate chains |
 
 ## Testing
@@ -129,5 +132,8 @@ See `.env.example`. Notables:
 
 - One prompt at a time per conversation; messages sent while busy are queued FIFO.
 - Session history lives in the Copilot process; a gateway restart starts a
-  fresh Copilot session (Slack history remains for humans).
+  fresh Copilot session. The first prompt after a fresh start is prepended with
+  the conversation's location (workspace, channel ID, thread) and recent Slack
+  messages (authorized users and the bot only) so the agent recovers context;
+  `/new` skips the history but still gets the location.
 - File access via the ACP fs bridge is confined to `GATEWAY_CWD`.

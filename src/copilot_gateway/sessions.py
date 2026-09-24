@@ -32,6 +32,7 @@ class Conversation:
     created_at: float = 0.0
     queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
     worker: asyncio.Task[None] | None = None
+    skip_history_on_next_start: bool = False
 
     def stale(self, max_age_hours: float) -> bool:
         if self.session is None or not self.session.alive:
@@ -229,6 +230,7 @@ class SessionRegistry:
             await conv.session.close()
             conv.session = None
             conv.created_at = 0.0
+            conv.skip_history_on_next_start = True  # /new promises a clean slate
             self._save_metadata()
             return True
 
